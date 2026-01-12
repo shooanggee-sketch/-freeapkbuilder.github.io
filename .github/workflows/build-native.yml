@@ -1,0 +1,141 @@
+name: Build Native APK from description
+
+on:
+  workflow_dispatch:
+    inputs:
+      description:
+        description: 'App description (short)'
+        required: true
+        default: 'Hello from mobile-built app'
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 11
+        uses: actions/setup-java@v4
+        with:
+          java-version: '11'
+
+      - name: Install required packages (gradle, unzip, wget)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip wget gradle
+
+      - name: Install Android SDK commandline-tools and platform
+        run: |
+          ANDROID_SDK_ROOT="$HOME/android-sdk"
+          mkdir -p "${ANDROID_SDK_ROOT}/cmdline-tools"
+          cd "$HOME"
+          wget -q https://dl.google.com/android/repository/commandlinetools-linux-9477386_latest.zip -O cmdline.zip
+          unzip -q cmdline.zip -d cmdline-tools
+          rm cmdline.zip
+          export PATH="${ANDROID_SDK_ROOT}/cmdline-tools/cmdline-tools/bin:${PATH}"
+          yes | "${ANDROID_SDK_ROOT}/cmdline-tools/cmdline-tools/bin/sdkmanager" --sdk_root="${ANDROID_SDK_ROOT}" "platform-tools" "platforms;android-31" "build-tools;31.0.0"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT}" >> $GITHUB_ENV
+          echo "${ANDROID_SDK_ROOT}/platform-tools" >> $GITHUB_PATH
+          echo "${ANDROID_SDK_ROOT}/cmdline-tools/cmdline-tools/bin" >> $GITHUB_PATH
+
+      - name: Create generator script
+        run: |
+          mkdir -p scripts
+          cat > scripts/generate_native.sh <<'SH'
+          #!/usr/bin/env bash
+          set -e
+          DESCRIPTION="$1"
+          OUTDIR="generated"
+          rm -rf "${OUTDIR}"
+          mkdir -p "${OUTDIR}/app/src/main/java/com/example/demo"
+          mkdir -p "${OUTDIR}/app/src/main/res/layout"
+          # settings.gradle
+          cat > "${OUTDIR}/settings.gradle" <<EOF
+          rootProject.name = "DemoApp"
+          include ':app'
+          EOF
+          # top-level build.gradle
+          cat > "${OUTDIR}/build.gradle" <<EOF
+          buildscript {
+            repositories { google(); mavenCentral() }
+            dependencies { classpath("com.android.tools.build:gradle:7.2.2") }
+          }
+          allprojects { repositories { google(); mavenCentral() } }
+          EOF
+          # app module build.gradle
+          cat > "${OUTDIR}/app/build.gradle" <<EOF
+          plugins {
+            id 'com.android.application'
+            id 'kotlin-android'
+          }
+          android {
+              compileSdk 31
+              defaultConfig {
+                  applicationId "com.example.demo"
+                  minSdk 21
+                  targetSdk 31
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes { release { minifyEnabled false } }
+          }
+          dependencies {
+              implementation "org.jetbrains.kotlin:kotlin-stdlib:1.6.10"
+              implementation 'androidx.appcompat:appcompat:1.3.1'
+              implementation 'com.google.android.material:material:1.4.0'
+          }
+          EOF
+          # Manifest
+          mkdir -p "${OUTDIR}/app/src/main"
+          cat > "${OUTDIR}/app/src/main/AndroidManifest.xml" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest package="com.example.demo" xmlns:android="http://schemas.android.com/apk/res/android">
+              <application android:label="DemoApp" android:allowBackup="true" android:icon="@mipmap/ic_launcher">
+                  <activity android:name=".MainActivity">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          # layout
+          cat > "${OUTDIR}/app/src/main/res/layout/activity_main.xml" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android" android:orientation="vertical" android:layout_width="match_parent" android:layout_height="match_parent" android:gravity="center">
+            <TextView android:id="@+id/tv" android:layout_width="wrap_content" android:layout_height="wrap_content" android:text="${DESCRIPTION}" android:textSize="18sp"/>
+          </LinearLayout>
+          EOF
+          # MainActivity.kt
+          cat > "${OUTDIR}/app/src/main/java/com/example/demo/MainActivity.kt" <<EOF
+          package com.example.demo
+          import android.os.Bundle
+          import androidx.appcompat.app.AppCompatActivity
+          class MainActivity : AppCompatActivity() {
+            override fun onCreate(savedInstanceState: Bundle?) {
+              super.onCreate(savedInstanceState)
+              setContentView(R.layout.activity_main)
+            }
+          }
+          EOF
+          chmod +x scripts/generate_native.sh
+          SH
+
+      - name: Generate app from description
+        run: |
+          chmod +x scripts/generate_native.sh
+          ./scripts/generate_native.sh "${{ github.event.inputs.description }}"
+
+      - name: Build APK (assembleDebug)
+        run: |
+          cd generated
+          # Use system gradle (installed above). On success, APK will be at app/build/outputs/apk/debug/app-debug.apk
+          gradle assembleDebug --no-daemon
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug-apk
+          path: generated/app/build/outputs/apk/debug/app-debug.apk
