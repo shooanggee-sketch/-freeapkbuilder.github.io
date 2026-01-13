@@ -1,0 +1,78 @@
+// api/convert-and-create-session.js (Node.js / Vercel style)
+const fetch = require('node-fetch'); // Vercel میں native fetch بھی ہو سکتا ہے
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
+const EXCHANGE_CACHE = {}; // in-memory cache for demo; for prod use Redis or durable cache
+const CACHE_TTL_MS = 1000 * 60 * 5; // 5 minutes
+
+async function getRate(toCurrency) {
+  const key = `USD_${toCurrency}`;
+  const now = Date.now();
+  if (EXCHANGE_CACHE[key] && (now - EXCHANGE_CACHE[key].ts) < CACHE_TTL_MS) {
+    return EXCHANGE_CACHE[key].data;
+  }
+  // Use exchangerate.host
+  const url = `https://api.exchangerate.host/convert?from=USD&to=${encodeURIComponent(toCurrency)}&amount=1`;
+  const res = await fetch(url);
+  const json = await res.json();
+  if (!json || !json.info || !json.info.rate) throw new Error('Exchange rate fetch failed');
+  const rate = json.info.rate;
+  EXCHANGE_CACHE[key] = { ts: now, data: { rate, date: json.date } };
+  return EXCHANGE_CACHE[key].data;
+}
+
+module.exports = async (req, res) => {
+  try {
+    if (req.method !== 'POST') return res.status(405).send({ error: 'Method not allowed' });
+
+    const { baseUsdAmount, currency } = req.body; // baseUsdAmount in USD (e.g., 0.5)
+    if (!baseUsdAmount || !currency) return res.status(400).json({ error: 'Missing params' });
+
+    // 1) Get rate
+    const { rate, date } = await getRate(currency);
+
+    // 2) Compute local amount (rounding rules: typically 2 decimals)
+    const localAmount = +(baseUsdAmount * rate).toFixed(2);
+
+    // 3) Optionally compute platform fee
+    const platformFeeLocal = +(localAmount * 0.10).toFixed(2);
+    const totalLocal = +(localAmount + platformFeeLocal).toFixed(2);
+
+    // 4) Create Stripe Checkout Session charging in local currency
+    // Note: Stripe expects amount in minor unit (cents for USD/EUR, paise for INR where applicable)
+    const amountCents = Math.round(totalLocal * 100); // adjust for currencies without 2 decimals if needed
+
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      line_items: [{
+        price_data: {
+          currency: currency.toLowerCase(),
+          product_data: { name: 'AI generation + platform fee' },
+          unit_amount: amountCents,
+        },
+        quantity: 1
+      }],
+      mode: 'payment',
+      success_url: `${process.env.DOMAIN}/success.html?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.DOMAIN}/?canceled=true`,
+      metadata: {
+        base_usd: String(baseUsdAmount),
+        rate: String(rate),
+        rate_date: String(date),
+        local_amount: String(localAmount),
+        platform_fee_local: String(platformFeeLocal)
+      }
+    });
+
+    return res.json({
+      url: session.url,
+      localAmount,
+      platformFeeLocal,
+      rate,
+      rateDate: date
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+};
